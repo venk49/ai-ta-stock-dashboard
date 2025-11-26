@@ -49,11 +49,26 @@ except Exception:
     logger.info("Kaleido not available.")
 
 # Get API key from Streamlit secrets or environment
-GOOGLE_API_KEY = None
-if hasattr(st, "secrets") and st.secrets.get("GOOGLE_API_KEY"):
-    GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY")
-else:
+# SAFE: Get API key from Streamlit secrets or environment without throwing errors
+GOOGLE_API_KEY = ""
+
+try:
+    # Attempt to read st.secrets
+    if hasattr(st, "secrets"):
+        try:
+            GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", "")
+        except Exception as e:
+            logger.info(f"st.secrets not available: {e}")
+            GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+    else:
+        GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+except Exception as e:
+    logger.info(f"Secrets read failed: {e}")
     GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+
+if not GOOGLE_API_KEY:
+    logger.info("No GOOGLE_API_KEY found in st.secrets or environment.")
+
 
 if GOOGLE_API_KEY:
     try:
