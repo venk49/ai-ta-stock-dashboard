@@ -2,26 +2,55 @@
 AI-Powered Technical Stock Analysis Dashboard
 - Robust yfinance fetching for NSE/ETFs
 - Safe Plotly image export with kaleido fallback
-- Gemini (Google Generative AI) integration if GOOGLE_API_KEY provided
-- Uses Streamlit secrets and environment variables for API key
+- Gemini (Google Generative AI) integration if GOOGLE_API_KEY provided and package installed
+- Uses Streamlit secrets and environment variables for API key (safe access)
 - Full logging to error.log and console + quick log tail in sidebar
 - Added: Williams %R indicator with configurable period and its own subplot
 - Modified: Replaced 20-Day EMA with 8-Day EMA
 """
 
-import streamlit as st
-import yfinance as yf
-import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import google.generativeai as genai
+from datetime import datetime, timedelta
 import tempfile
 import os
 import json
-from datetime import datetime, timedelta
 import logging
 import sys
 from typing import Tuple
+
+import streamlit as st
+import importlib
+
+# ---------------------------
+# Safe optional imports
+# ---------------------------
+def optional_import(module_name: str):
+    try:
+        return importlib.import_module(module_name)
+    except Exception:
+        return None
+
+yf = optional_import("yfinance")
+pd = optional_import("pandas")
+go = optional_import("plotly.graph_objects")
+make_subplots = None
+plotly_subplots = optional_import("plotly.subplots")
+if plotly_subplots is not None:
+    make_subplots = getattr(plotly_subplots, "make_subplots", None)
+
+genai = optional_import("google.generativeai")  # may be None
+kaleido = optional_import("kaleido")  # used only for fig.write_image
+
+# Basic sanity: required packages check
+_required_missing = []
+if pd is None:
+    _required_missing.append("pandas")
+if go is None or make_subplots is None:
+    _required_missing.append("plotly")
+if yf is None:
+    # yfinance is optional (we will still try), but warn if missing
+    _yfinance_missing = True
+else:
+    _yfinance_missing = False
 
 # -------- GLOBAL LOGGING CONFIGURATION --------
 LOG_FILE = "error.log"
@@ -37,58 +66,70 @@ logging.basicConfig(
 
 logger = logging.getLogger("stock_dashboard")
 logger.info("App started.")
-# ----------------------------------------------
 
-# Try to detect kaleido so we can inform the user early
-try:
-    import kaleido  # noqa: F401
+if kaleido is not None:
     _HAS_KALEIDO = True
     logger.info("Kaleido detected.")
-except Exception:
+else:
     _HAS_KALEIDO = False
     logger.info("Kaleido not available.")
 
-# Get API key from Streamlit secrets or environment
-# SAFE: Get API key from Streamlit secrets or environment without throwing errors
-GOOGLE_API_KEY = ""
-
-try:
-    # Attempt to read st.secrets
-    if hasattr(st, "secrets"):
-        try:
-            GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", "")
-        except Exception as e:
-            logger.info(f"st.secrets not available: {e}")
-            GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
-    else:
-        GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
-except Exception as e:
-    logger.info(f"Secrets read failed: {e}")
-    GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
-
-if not GOOGLE_API_KEY:
-    logger.info("No GOOGLE_API_KEY found in st.secrets or environment.")
-
-
-if GOOGLE_API_KEY:
+# ---------------------------
+# SAFE: Get API key from Streamlit secrets or environment
+# ---------------------------
+def get_secret(name: str, default: str = "") -> str:
+    """Safely retrieve secrets from st.secrets or environment without raising."""
     try:
-        genai.configure(api_key=GOOGLE_API_KEY)
-        MODEL_NAME = "gemini-2.0-flash"
-        gen_model = genai.GenerativeModel(MODEL_NAME)
-        logger.info("Gemini configured.")
+        # st.secrets may be present but reading might raise in some contexts, so guard it
+        if hasattr(st, "secrets"):
+            try:
+                val = st.secrets.get(name, None)
+                if val is not None and val != "":
+                    return val
+            except Exception:
+                # fallback to environment
+                pass
+        return os.environ.get(name, default)
     except Exception as e:
-        gen_model = None
-        logger.exception("Failed to configure Gemini: %s", e)
-        st.warning("Gemini configuration failed. Check GOOGLE_API_KEY and network.")
-else:
-    gen_model = None
-    st.warning("Gemini API key not configured. Set GOOGLE_API_KEY in Streamlit secrets or environment variables to enable AI analysis.")
-    logger.info("Gemini API key not configured.")
+        logger.exception("Error reading secret %s: %s", name, e)
+        return default
 
-# UI
+GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY", "")
+
+# Configure Gemini only if package present and key present
+gen_model = None
+if genai is None:
+    logger.info("google.generativeai package not installed; Gemini features disabled.")
+else:
+    if not GOOGLE_API_KEY:
+        logger.info("GOOGLE_API_KEY not found; Gemini features disabled.")
+    else:
+        try:
+            genai.configure(api_key=GOOGLE_API_KEY)
+            MODEL_NAME = "gemini-2.0-flash"
+            # safe guard: GenerativeModel may or may not be available depending on package version
+            gen_model_cls = getattr(genai, "GenerativeModel", None)
+            if gen_model_cls:
+                gen_model = gen_model_cls(MODEL_NAME)
+                logger.info("Gemini configured with model %s.", MODEL_NAME)
+            else:
+                logger.warning("google.generativeai installed but GenerativeModel unavailable in this version.")
+                gen_model = None
+        except Exception as e:
+            logger.exception("Failed to configure Gemini: %s", e)
+            gen_model = None
+
+# ---------------------------
+# Streamlit page config
+# ---------------------------
 st.set_page_config(layout="wide")
 st.title("AI-Powered Technical Stock Analysis Dashboard")
 st.sidebar.header("Configuration")
+
+# Show missing-critical-deps message (if any)
+if _required_missing:
+    st.error("Missing required packages: " + ", ".join(_required_missing) + ". Add them to requirements.txt and redeploy.")
+    logger.error("Missing required packages on startup: %s", _required_missing)
 
 # Show a small log tail in the sidebar for quick debugging
 def tail_logs(logfile: str, lines: int = 12) -> str:
@@ -131,8 +172,15 @@ indicators = st.sidebar.multiselect(
 willr_period = st.sidebar.number_input("Williams %R Period (days)", min_value=5, max_value=100, value=14)
 
 # Helper: robust history fetch
-def fetch_symbol_history(symbol: str, start: str, end: str) -> pd.DataFrame:
+def fetch_symbol_history(symbol: str, start: str, end: str):
+    """
+    Return a pandas DataFrame (or an empty DataFrame if failures).
+    This function is tolerant: it will try start/end fetch first then fall back to period-based fetch.
+    """
     logger.info("Fetching history for: %s | %s → %s", symbol, start, end)
+    if yf is None:
+        logger.error("yfinance not installed; cannot fetch data for %s", symbol)
+        return pd.DataFrame() if pd else {}
     try:
         tk = yf.Ticker(symbol)
         df = tk.history(start=start, end=end, interval="1d")
@@ -147,7 +195,7 @@ def fetch_symbol_history(symbol: str, start: str, end: str) -> pd.DataFrame:
                 period = "365d"
             df = tk.history(period=period, interval="1d")
 
-        if isinstance(df, pd.DataFrame):
+        if hasattr(df, "dropna"):
             df = df.dropna(how="all")
             logger.info("Fetched %d rows for %s", len(df), symbol)
         else:
@@ -167,13 +215,16 @@ if st.sidebar.button("Fetch Data"):
         st.sidebar.info(f"Fetching {ticker} ...")
         try:
             df = fetch_symbol_history(ticker, start_date_str, end_date_str)
-            if df.empty:
+            if df is None or (hasattr(df, "empty") and df.empty):
                 st.warning(f"No data found for {ticker}. Try different dates or symbol.")
                 logger.warning("No data for %s after fetch.", ticker)
             else:
-                # standardize column names
-                df = df.rename(columns={c: c.capitalize() for c in df.columns})
-                stock_data[ticker] = df
+                # standardize column names to expected Title case used later
+                if isinstance(df, pd.DataFrame):
+                    df = df.rename(columns={c: c.capitalize() for c in df.columns})
+                    stock_data[ticker] = df
+                else:
+                    logger.error("Returned object for %s is not a DataFrame", ticker)
         except Exception as e:
             logger.exception("Unhandled exception fetching %s: %s", ticker, e)
             st.error(f"Error fetching {ticker}: {e}")
@@ -186,10 +237,25 @@ if st.sidebar.button("Fetch Data"):
         st.error("No stock data loaded. Adjust tickers or dates and try again.")
         logger.warning("No stock data loaded after fetch attempt.")
 
-# Analysis
+# Analysis block
 if "stock_data" in st.session_state and st.session_state["stock_data"]:
-    def analyze_ticker(ticker: str, data: pd.DataFrame) -> Tuple[go.Figure, dict]:
+    def analyze_ticker(ticker: str, data):
+        """
+        Returns (fig, result_dict).
+        fig: plotly.graph_objects.Figure (or None if plotly missing)
+        result: dict with keys 'action' and 'justification'
+        """
         logger.info("Analyzing ticker: %s", ticker)
+
+        # Prepare a default empty result
+        result = {"action": "N/A", "justification": "AI analysis not run."}
+
+        # Validate data
+        if pd is None or go is None or make_subplots is None:
+            logger.error("Pandas/Plotly not available, cannot analyze %s", ticker)
+            st.error("Pandas or Plotly missing; cannot produce analysis.")
+            return None, {"action": "Error", "justification": "Pandas or Plotly not installed."}
+
         df = data.copy()
         if not isinstance(df.index, pd.DatetimeIndex):
             try:
@@ -198,27 +264,36 @@ if "stock_data" in st.session_state and st.session_state["stock_data"]:
             except Exception as e:
                 logger.exception("Failed to convert index to datetime for %s: %s", ticker, e)
 
-        # Prepare subplot: main candlestick + indicators on top, Williams %R on bottom if selected
+        # Determine rows/height for Williams %R
         rows = 2 if "Williams %R" in indicators else 1
         row_heights = [0.7, 0.3] if rows == 2 else [1.0]
         shared_x = True
 
-        fig = make_subplots(rows=rows, cols=1, shared_xaxes=shared_x, row_heights=row_heights,
-                            vertical_spacing=0.03, specs=[[{"secondary_y": False}]] * rows)
+        # Create figure
+        try:
+            fig = make_subplots(rows=rows, cols=1, shared_xaxes=shared_x, row_heights=row_heights,
+                                vertical_spacing=0.03, specs=[[{"secondary_y": False}]] * rows)
+        except Exception as e:
+            logger.exception("Failed to create subplots for %s: %s", ticker, e)
+            return None, {"action": "Error", "justification": f"Plotly subplots failed: {e}"}
 
         # Candlestick in row 1
-        fig.add_trace(
-            go.Candlestick(
-                x=df.index,
-                open=df.get('Open'),
-                high=df.get('High'),
-                low=df.get('Low'),
-                close=df.get('Close'),
-                name="Candlestick"
-            ), row=1, col=1
-        )
+        try:
+            fig.add_trace(
+                go.Candlestick(
+                    x=df.index,
+                    open=df.get('Open'),
+                    high=df.get('High'),
+                    low=df.get('Low'),
+                    close=df.get('Close'),
+                    name="Candlestick"
+                ), row=1, col=1
+            )
+        except Exception as e:
+            logger.exception("Failed to add candlestick for %s: %s", ticker, e)
 
-        # Indicators on same (top) subplot
+        # Indicators
+        image_error = None
         try:
             if "20-Day SMA" in indicators and 'Close' in df:
                 sma = df['Close'].rolling(window=20, min_periods=1).mean()
@@ -245,13 +320,17 @@ if "stock_data" in st.session_state and st.session_state["stock_data"]:
                 ll = df['Low'].rolling(window=willr_period, min_periods=1).min()
                 denom = (hh - ll).replace(0, pd.NA)
                 willr = (hh - df['Close']) / denom * -100
-                # Ensure same index
                 willr = willr.fillna(method='ffill').fillna(method='bfill')
                 # Add to second row
                 fig.add_trace(go.Scatter(x=df.index, y=willr, mode='lines', name=f"Williams %R ({willr_period})"), row=2, col=1)
-                # Add overbought/oversold lines (-20, -80)
-                fig.add_hline(y=-20, line_dash="dash", row=2, col=1, annotation_text="-20 (Overbought)", annotation_position="top left")
-                fig.add_hline(y=-80, line_dash="dash", row=2, col=1, annotation_text="-80 (Oversold)", annotation_position="bottom left")
+                # Add overbought/oversold lines in second row
+                try:
+                    fig.add_hline(y=-20, line_dash="dash", row=2, col=1, annotation_text="-20 (Overbought)", annotation_position="top left")
+                    fig.add_hline(y=-80, line_dash="dash", row=2, col=1, annotation_text="-80 (Oversold)", annotation_position="bottom left")
+                except Exception:
+                    # older plotly versions may not support row/col in add_hline; fallback to shapes if needed
+                    fig.add_shape(type="line", x0=df.index[0], x1=df.index[-1], y0=-20, y1=-20, yref="y2", line=dict(dash="dash"))
+                    fig.add_shape(type="line", x0=df.index[0], x1=df.index[-1], y0=-80, y1=-80, yref="y2", line=dict(dash="dash"))
 
         except Exception as e:
             logger.exception("Error computing indicators for %s: %s", ticker, e)
@@ -260,18 +339,25 @@ if "stock_data" in st.session_state and st.session_state["stock_data"]:
 
         # Try image export (kaleido) safely
         image_bytes = None
-        image_error = None
         tmpname = None
         if _HAS_KALEIDO:
             try:
                 logger.info("Attempting image export for %s...", ticker)
                 with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmpfile:
                     tmpname = tmpfile.name
-                fig.write_image(tmpname, engine="kaleido")
+                # use engine="kaleido"; write_image may require kaleido installed
+                try:
+                    fig.write_image(tmpname, engine="kaleido")
+                except TypeError:
+                    # some plotly versions don't accept engine kwarg
+                    fig.write_image(tmpname)
                 with open(tmpname, "rb") as f:
                     image_bytes = f.read()
-                os.remove(tmpname)
-                tmpname = None
+                try:
+                    os.remove(tmpname)
+                except Exception:
+                    logger.exception("Failed to remove temporary image file %s", tmpname)
+                    tmpname = None
                 logger.info("Image exported successfully for %s", ticker)
             except Exception as e:
                 image_error = str(e)
@@ -282,7 +368,7 @@ if "stock_data" in st.session_state and st.session_state["stock_data"]:
                 except Exception:
                     logger.exception("Failed to remove temporary image file %s", tmpname)
         else:
-            image_error = "Kaleido not installed. Run: python -m pip install --upgrade kaleido"
+            image_error = "Kaleido not installed. Install with: python -m pip install --upgrade kaleido"
             logger.info(image_error)
 
         # Build prompt and call Gemini (if configured)
@@ -297,34 +383,56 @@ if "stock_data" in st.session_state and st.session_state["stock_data"]:
 
         contents = []
         contents.append({"role": "user", "parts": [analysis_prompt]})
+
         if image_bytes and gen_model is not None:
-            image_part = {"data": image_bytes, "mime_type": "image/png"}
-            contents.append({"role": "user", "parts": [image_part]})
-            logger.info("Attached chart image to Gemini request for %s", ticker)
+            # gemini supports attaching binary parts depending on SDK; if this fails gracefully fallback to text-only
+            try:
+                image_part = {"data": image_bytes, "mime_type": "image/png"}
+                contents.append({"role": "user", "parts": [image_part]})
+                logger.info("Attached chart image to Gemini request for %s", ticker)
+            except Exception:
+                logger.exception("Failed to attach image bytes to Gemini request for %s", ticker)
+                contents.append({"role": "user", "parts": ["Note: chart image could not be attached; please analyze based on text."]})
         elif not _HAS_KALEIDO:
             contents.append({"role": "user", "parts": [f"Note: Image export unavailable ({image_error}). Please analyze using textual description only."]})
             logger.info("Gemini will be asked to analyze without image for %s", ticker)
 
-        result = {"action": "N/A", "justification": "AI analysis not run (Gemini API key not configured)."}
+        # Default result if AI not run
+        result = {"action": "N/A", "justification": "AI analysis not run (Gemini not configured or unavailable)."}
+
         if gen_model is not None:
             try:
                 logger.info("Sending request to Gemini for %s", ticker)
-                response = gen_model.generate_content(contents=contents)
-                result_text = getattr(response, "text", "") or str(response)
-                logger.info("Raw Gemini response (first 300 chars) for %s: %s", ticker, result_text[:300])
-                json_start_index = result_text.find('{')
-                json_end_index = result_text.rfind('}') + 1
-                if json_start_index != -1 and json_end_index > json_start_index:
-                    json_string = result_text[json_start_index:json_end_index]
-                    try:
-                        result = json.loads(json_string)
-                        logger.info("Parsed Gemini JSON for %s: %s", ticker, result)
-                    except Exception as je:
-                        logger.exception("JSON parse failed for %s: %s", ticker, je)
-                        result = {"action": "Error", "justification": f"Failed to parse JSON from Gemini response. Raw: {result_text}"}
+                # Depending on SDK version, generate_content/generate or other name may exist — try safe calling
+                gen_call = getattr(gen_model, "generate_content", None) or getattr(gen_model, "generate", None)
+                if gen_call is None:
+                    logger.warning("Gemini SDK does not expose generate_content/generate; skipping AI call.")
                 else:
-                    logger.error("Gemini returned no valid JSON for %s.", ticker)
-                    result = {"action": "Error", "justification": f"No JSON found. Raw response:\n{result_text}"}
+                    response = gen_call(contents=contents)
+                    # Extract textual output safely
+                    result_text = ""
+                    try:
+                        # SDK may have attributes like text or content; fallback to str(response)
+                        result_text = getattr(response, "text", None) or getattr(response, "content", None) or str(response)
+                        logger.info("Raw Gemini response (first 300 chars) for %s: %s", ticker, result_text[:300])
+                    except Exception:
+                        result_text = str(response)
+
+                    # crude JSON extraction from returned text (best-effort)
+                    json_start_index = result_text.find('{')
+                    json_end_index = result_text.rfind('}') + 1
+                    if json_start_index != -1 and json_end_index > json_start_index:
+                        json_string = result_text[json_start_index:json_end_index]
+                        try:
+                            parsed = json.loads(json_string)
+                            result = parsed
+                            logger.info("Parsed Gemini JSON for %s: %s", ticker, parsed)
+                        except Exception as je:
+                            logger.exception("JSON parse failed for %s: %s", ticker, je)
+                            result = {"action": "Error", "justification": f"Failed to parse JSON from Gemini response. Raw: {result_text}"}
+                    else:
+                        logger.error("Gemini returned no valid JSON for %s. Raw: %s", ticker, result_text)
+                        result = {"action": "Error", "justification": f"No JSON found. Raw response:\n{result_text}"}
             except Exception as e:
                 logger.exception("Gemini API error for %s: %s", ticker, e)
                 result = {"action": "Error", "justification": f"Gemini API error: {e}. {image_error or ''}"}
@@ -348,7 +456,10 @@ if "stock_data" in st.session_state and st.session_state["stock_data"]:
             overall_results.append({"Stock": ticker, "Recommendation": result.get("action", "N/A")})
             with tabs[i + 1]:
                 st.subheader(f"Analysis for {ticker}")
-                st.plotly_chart(fig, use_container_width=True)
+                if fig is not None:
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.warning("Plotly figure unavailable.")
                 st.write("**Detailed Justification:**")
                 st.write(result.get("justification", "No justification provided."))
             logger.info("Analysis displayed for %s", ticker)
@@ -359,8 +470,11 @@ if "stock_data" in st.session_state and st.session_state["stock_data"]:
 
     with tabs[0]:
         st.subheader("Overall Structured Recommendations")
-        df_summary = pd.DataFrame(overall_results)
-        st.table(df_summary)
+        if pd is not None:
+            df_summary = pd.DataFrame(overall_results)
+            st.table(df_summary)
+        else:
+            st.write(overall_results)
 
 else:
     st.info("Please fetch stock data using the sidebar.")
