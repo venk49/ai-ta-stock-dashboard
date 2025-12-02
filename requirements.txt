@@ -2,4 +2,12 @@ streamlit==1.26.0
 yfinance==0.2.25
 pandas==2.2.2
 plotly==5.19.0
-google-generativeai==0.3.0
+
+# Needed for exporting charts to PNG for Gemini image analysis
+kaleido==0.2.1
+
+# Gemini SDK — must be updated from your version
+google-generativeai>=0.8.5
+
+# Optional but common dependency used by Google SDK
+protobuf>=4.25.1
